@@ -101,7 +101,7 @@ pub fn process_instruction(
                 return Err(ProgramError::InsufficientFunds);
             }
 
-            let total_cost = cake_state.price * amount;
+            let total_cost = cake_state.price * amount * 1_000_000_000; // Ajuste para 9 decimais
             cake_state.stock -= amount;
             cake_state.pack_into_slice(&mut cake_account.data.borrow_mut());
 
