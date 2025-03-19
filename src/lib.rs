@@ -127,6 +127,8 @@ pub fn process_instruction(
             )?;
             msg!("Venda realizada: {} bolos", amount);
         }
+        _ => return Err(ProgramError::InvalidInstructionData),
+    }
 
     Ok(())
 }
