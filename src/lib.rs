@@ -101,9 +101,13 @@ pub fn process_instruction(
                 return Err(ProgramError::InsufficientFunds);
             }
 
-            let total_cost = cake_state.price * amount * 1_000_000_000; // Ajuste para 9 decimais
+            // Ajuste apenas para os decimais do token (9 decimais)
+            let token_amount = amount * 1_000_000_000; // 10 tokens = 10 * 10^9 lamports
             cake_state.stock -= amount;
             cake_state.pack_into_slice(&mut cake_account.data.borrow_mut());
+
+            // Log para depuração
+            msg!("Transferindo {} tokens ({} lamports)", amount, token_amount);
 
             invoke(
                 &spl_token::instruction::transfer(
@@ -112,7 +116,7 @@ pub fn process_instruction(
                     owner_token_account.key,
                     buyer.key,
                     &[],
-                    total_cost,
+                    token_amount, // Use apenas a quantidade de tokens, ajustada
                 )?,
                 &[
                     buyer_token_account.clone(),
@@ -121,10 +125,8 @@ pub fn process_instruction(
                     token_program.clone(),
                 ],
             )?;
-            msg!("Venda realizada: {} bolos por {}", amount, total_cost);
+            msg!("Venda realizada: {} bolos", amount);
         }
-        _ => return Err(ProgramError::InvalidInstructionData),
-    }
 
     Ok(())
 }
