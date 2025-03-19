@@ -15,7 +15,3 @@ spl-token = { version = "4.0", features = ["no-entrypoint"] }
 solana-sdk = "1.18.26"
 serde_json = "1.0"
 tempfile = "3.10"
-
-[[bin]]
-name = "extract_pubkey"
-path = "src/bin/extract_pubkey.rs"
