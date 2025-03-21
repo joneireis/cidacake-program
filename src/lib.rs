@@ -1,17 +1,20 @@
-#[allow(unexpected_cfgs)]
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint,
     entrypoint::ProgramResult,
     msg,
-    program::{invoke},
     program_error::ProgramError,
-    program_pack::{Pack, Sealed, IsInitialized},
     pubkey::Pubkey,
+    rent::Rent,
+    sysvar::Sysvar,
+    program_pack::{Pack, Sealed, IsInitialized},
+    system_instruction,
+    system_program,
+    program::invoke_signed,
+    sysvar::clock::Clock,
 };
-use borsh::{BorshDeserialize, BorshSerialize};
 
-#[derive(BorshSerialize, BorshDeserialize, Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CakeState {
     pub stock: u64,
     pub price: u64,
@@ -22,87 +25,162 @@ impl Sealed for CakeState {}
 
 impl IsInitialized for CakeState {
     fn is_initialized(&self) -> bool {
-        self.owner != Pubkey::default() // Considera inicializado se o owner não for zero
+        true // Consideramos que a conta está inicializada se os dados têm o tamanho correto
     }
 }
 
 impl Pack for CakeState {
-    const LEN: usize = 8 + 8 + 32; // stock (u64) + price (u64) + owner (Pubkey)
+    const LEN: usize = 48;
 
     fn pack_into_slice(&self, dst: &mut [u8]) {
-        let data = self.try_to_vec().expect("Failed to serialize CakeState");
-        dst[..data.len()].copy_from_slice(&data);
+        let slice = dst;
+        slice[..8].copy_from_slice(&self.stock.to_le_bytes());
+        slice[8..16].copy_from_slice(&self.price.to_le_bytes());
+        slice[16..48].copy_from_slice(self.owner.as_ref());
     }
 
     fn unpack_from_slice(src: &[u8]) -> Result<Self, ProgramError> {
-        Self::try_from_slice(src).map_err(|_| ProgramError::InvalidAccountData)
+        if src.len() != Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let stock = u64::from_le_bytes(src[..8].try_into().unwrap());
+        let price = u64::from_le_bytes(src[8..16].try_into().unwrap());
+        let owner = Pubkey::try_from(&src[16..48]).map_err(|_| ProgramError::InvalidAccountData)?;
+        Ok(CakeState { stock, price, owner })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PurchaseHistory {
+    pub product_id: u8,
+    pub quantity: u64,
+    pub total_price: u64,
+    pub buyer: Pubkey,
+    pub timestamp: i64,
+}
+
+impl Sealed for PurchaseHistory {}
+
+impl IsInitialized for PurchaseHistory {
+    fn is_initialized(&self) -> bool {
+        true
+    }
+}
+
+impl Pack for PurchaseHistory {
+    const LEN: usize = 57;
+
+    fn pack_into_slice(&self, dst: &mut [u8]) {
+        let slice = dst;
+        slice[0] = self.product_id;
+        slice[1..9].copy_from_slice(&self.quantity.to_le_bytes());
+        slice[9..17].copy_from_slice(&self.total_price.to_le_bytes());
+        slice[17..49].copy_from_slice(self.buyer.as_ref());
+        slice[49..57].copy_from_slice(&self.timestamp.to_le_bytes());
+    }
+
+    fn unpack_from_slice(src: &[u8]) -> Result<Self, ProgramError> {
+        if src.len() != Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let product_id = src[0];
+        let quantity = u64::from_le_bytes(src[1..9].try_into().unwrap());
+        let total_price = u64::from_le_bytes(src[9..17].try_into().unwrap());
+        let buyer = Pubkey::try_from(&src[17..49]).map_err(|_| ProgramError::InvalidAccountData)?;
+        let timestamp = i64::from_le_bytes(src[49..57].try_into().unwrap());
+        Ok(PurchaseHistory { product_id, quantity, total_price, buyer, timestamp })
     }
 }
 
 entrypoint!(process_instruction);
 
 pub fn process_instruction(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-    let owner = next_account_info(accounts_iter)?;
-    let cake_account = next_account_info(accounts_iter)?;
-
-    let owner_key = "yG9KfVSMZaMZHSY48KKxpvtdPZhbAMUsYsAfKZDUkW5"
-        .parse::<Pubkey>()
-        .map_err(|_| ProgramError::InvalidArgument)?;
-
-    if owner.key != &owner_key {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    match instruction_data[0] {
+    let instruction = instruction_data[0];
+    match instruction {
         0 => {
-            // Verificar se a conta já está inicializada
-            {
-                let cake_state_data = &cake_account.data.borrow();
-                if cake_state_data.len() >= CakeState::LEN {
-                    let cake_state = CakeState::unpack_from_slice(cake_state_data)?;
-                    if cake_state.is_initialized() {
-                        return Err(ProgramError::AccountAlreadyInitialized);
-                    }
-                }
+            msg!("Instrução: initialize");
+            let account_iter = &mut accounts.iter();
+            let cake_account = next_account_info(account_iter)?;
+            let owner = next_account_info(account_iter)?;
+            let payer = next_account_info(account_iter)?;
+            let system_program = next_account_info(account_iter)?;
+
+            if cake_account.owner != program_id {
+                return Err(ProgramError::IncorrectProgramId);
             }
 
-            // Inicializar a conta
-            let cake_state = CakeState {
-                stock: 100,
-                price: 1_000_000,
-                owner: *owner.key,
-            };
-            cake_state.pack_into_slice(&mut cake_account.data.borrow_mut());
+            // Verificar se a conta tem o tamanho correto
+            if cake_account.data.borrow().len() != CakeState::LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            // Inicializar os dados da conta
+            let mut cake_state = CakeState::unpack_unchecked(&cake_account.data.borrow())?;
+            cake_state.stock = 100;
+            cake_state.price = 1_000_000;
+            cake_state.owner = *owner.key;
+            CakeState::pack(cake_state, &mut cake_account.data.borrow_mut())?;
         }
         1 => {
-            let mut cake_state = CakeState::unpack(&cake_account.data.borrow())?;
-            let amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
-            cake_state.stock += amount;
-            cake_state.pack_into_slice(&mut cake_account.data.borrow_mut());
-            msg!("Estoque adicionado: {}", amount);
-        }
-        2 => {
-            let mut cake_state = CakeState::unpack(&cake_account.data.borrow())?;
-            let new_price = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
-            cake_state.price = new_price;
-            cake_state.pack_into_slice(&mut cake_account.data.borrow_mut());
-            msg!("Preço atualizado: {}", new_price);
-        }
-        3 => {
-            let buyer = next_account_info(accounts_iter)?;
-            let buyer_token_account = next_account_info(accounts_iter)?;
-            let owner_token_account = next_account_info(accounts_iter)?;
-            let token_program = next_account_info(accounts_iter)?;
-            let system_program = next_account_info(accounts_iter)?;
+            msg!("Instrução: add_stock");
+            let account_iter = &mut accounts.iter();
+            let cake_account = next_account_info(account_iter)?;
+            let owner = next_account_info(account_iter)?;
+
+            if cake_account.owner != program_id {
+                return Err(ProgramError::IncorrectProgramId);
+            }
 
             let mut cake_state = CakeState::unpack(&cake_account.data.borrow())?;
-            if cake_state.stock == 0 {
-                return Err(ProgramError::InsufficientFunds);
+            if cake_state.owner != *owner.key {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            let amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+            cake_state.stock += amount;
+            CakeState::pack(cake_state, &mut cake_account.data.borrow_mut())?;
+        }
+        2 => {
+            msg!("Instrução: update_price");
+            let account_iter = &mut accounts.iter();
+            let cake_account = next_account_info(account_iter)?;
+            let owner = next_account_info(account_iter)?;
+
+            if cake_account.owner != program_id {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+
+            let mut cake_state = CakeState::unpack(&cake_account.data.borrow())?;
+            if cake_state.owner != *owner.key {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            let new_price = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+            cake_state.price = new_price;
+            CakeState::pack(cake_state, &mut cake_account.data.borrow_mut())?;
+        }
+        3 => {
+            msg!("Instrução: sell");
+            let account_iter = &mut accounts.iter();
+            let owner = next_account_info(account_iter)?; // 0: owner
+            let cake_account = next_account_info(account_iter)?; // 1: cake_account
+            let buyer = next_account_info(account_iter)?; // 2: buyer
+            let system_program = next_account_info(account_iter)?; // 3: system_program
+            let history_account = next_account_info(account_iter)?; // 4: history_account
+            let payer = next_account_info(account_iter)?; // 5: payer
+            let clock = next_account_info(account_iter)?; // 6: clock
+
+            if cake_account.owner != program_id {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+
+            let mut cake_state = CakeState::unpack(&cake_account.data.borrow())?;
+            if cake_state.owner != *owner.key {
+                return Err(ProgramError::InvalidAccountData);
             }
 
             let amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
@@ -110,21 +188,16 @@ pub fn process_instruction(
                 return Err(ProgramError::InsufficientFunds);
             }
 
-            let token_amount = amount * 1_000_000_000;
-            let total_cost = cake_state.price * amount;
+            let total_price = amount * cake_state.price;
 
-            if **buyer.lamports.borrow() < total_cost {
-                msg!("Erro: Buyer não tem SOL suficiente. Necessário: {}, Disponível: {}", total_cost, **buyer.lamports.borrow());
-                return Err(ProgramError::InsufficientFunds);
-            }
-
-            // Transferir SOL do buyer para o owner usando SystemProgram::transfer
-            invoke(
-                &solana_program::system_instruction::transfer(
-                    buyer.key,
-                    owner.key,
-                    total_cost,
-                ),
+            // Transferir SOL do comprador para o owner
+            let transfer_ix = system_instruction::transfer(
+                buyer.key,
+                owner.key,
+                total_price,
+            );
+            solana_program::program::invoke(
+                &transfer_ix,
                 &[
                     buyer.clone(),
                     owner.clone(),
@@ -132,32 +205,139 @@ pub fn process_instruction(
                 ],
             )?;
 
+            // Atualizar o estoque
             cake_state.stock -= amount;
-            cake_state.pack_into_slice(&mut cake_account.data.borrow_mut());
+            CakeState::pack(cake_state, &mut cake_account.data.borrow_mut())?;
 
-            msg!("Transferindo {} tokens ({} lamports)", amount, token_amount);
-            msg!("Transferindo {} lamports (SOL) do buyer para o owner", total_cost);
+            // Criar uma nova conta de histórico
+            let rent = Rent::get()?;
+            let rent_lamports = rent.minimum_balance(PurchaseHistory::LEN);
 
-            invoke(
-                &spl_token::instruction::transfer(
-                    token_program.key,
-                    buyer_token_account.key,
-                    owner_token_account.key,
-                    buyer.key,
-                    &[],
-                    token_amount,
-                )?,
+            let create_history_account_ix = system_instruction::create_account(
+                payer.key,
+                history_account.key,
+                rent_lamports,
+                PurchaseHistory::LEN as u64,
+                program_id,
+            );
+
+            // Derivar o bump para o endereço da history_account
+            let (expected_history_account, bump) = Pubkey::find_program_address(
+                &[b"history", buyer.key.as_ref(), &[instruction_data[9]]],
+                program_id,
+            );
+
+            // Verificar se o history_account fornecido corresponde ao esperado
+            if *history_account.key != expected_history_account {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            // Incluir o bump nas sementes
+            invoke_signed(
+                &create_history_account_ix,
                 &[
-                    buyer_token_account.clone(),
-                    owner_token_account.clone(),
-                    buyer.clone(),
-                    token_program.clone(),
+                    payer.clone(),
+                    history_account.clone(),
+                    system_program.clone(),
+                ],
+                &[&[b"history", buyer.key.as_ref(), &[instruction_data[9]], &[bump]]],
+            )?;
+
+            let clock_info = Clock::from_account_info(clock)?;
+            let timestamp = clock_info.unix_timestamp;
+
+            let product_id = instruction_data[9]; // O product_id é enviado como o próximo byte após a quantidade
+
+            let history_entry = PurchaseHistory {
+                product_id,
+                quantity: amount,
+                total_price,
+                buyer: *buyer.key,
+                timestamp,
+            };
+            PurchaseHistory::pack(history_entry, &mut history_account.data.borrow_mut())?;
+        }
+        4 => {
+            msg!("Instrução: migrate_history");
+            let account_iter = &mut accounts.iter();
+            let history_account = next_account_info(account_iter)?;
+            let payer = next_account_info(account_iter)?;
+            let system_program = next_account_info(account_iter)?;
+            let buyer = next_account_info(account_iter)?;
+
+            // Criar uma nova conta de histórico
+            let rent = Rent::get()?;
+            let rent_lamports = rent.minimum_balance(PurchaseHistory::LEN);
+
+            let create_history_account_ix = system_instruction::create_account(
+                payer.key,
+                history_account.key,
+                rent_lamports,
+                PurchaseHistory::LEN as u64,
+                program_id,
+            );
+
+            invoke_signed(
+                &create_history_account_ix,
+                &[
+                    payer.clone(),
+                    history_account.clone(),
+                    system_program.clone(),
+                ],
+                &[&[b"history", buyer.key.as_ref(), &[instruction_data[1]]]],
+            )?;
+
+            let product_id = instruction_data[2]; // u8 (1 byte)
+            let quantity = u64::from_le_bytes(instruction_data[3..11].try_into().unwrap()); // u64 (8 bytes)
+            let total_price = u64::from_le_bytes(instruction_data[11..19].try_into().unwrap()); // u64 (8 bytes)
+            let buyer_pubkey = Pubkey::try_from(&instruction_data[19..51]).map_err(|_| ProgramError::InvalidAccountData)?; // Pubkey (32 bytes)
+            let timestamp = i64::from_le_bytes(instruction_data[51..59].try_into().unwrap()); // i64 (8 bytes)
+
+            let history_entry = PurchaseHistory {
+                product_id,
+                quantity,
+                total_price,
+                buyer: buyer_pubkey,
+                timestamp,
+            };
+            PurchaseHistory::pack(history_entry, &mut history_account.data.borrow_mut())?;
+        }
+        5 => {
+            msg!("Instrução: close_account");
+            let account_iter = &mut accounts.iter();
+            let cake_account = next_account_info(account_iter)?; // 0: cake_account
+            let owner = next_account_info(account_iter)?; // 1: owner
+            let system_program = next_account_info(account_iter)?; // 2: system_program
+
+            if cake_account.owner != program_id {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+
+            let cake_state = CakeState::unpack(&cake_account.data.borrow())?;
+            if cake_state.owner != *owner.key {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            // Reatribuir a conta ao SystemProgram
+            let assign_ix = system_instruction::assign(
+                cake_account.key,
+                &system_program::id(),
+            );
+            solana_program::program::invoke(
+                &assign_ix,
+                &[
+                    cake_account.clone(),
+                    system_program.clone(),
                 ],
             )?;
-            msg!("Venda realizada: {} bolos por {} lamports", amount, total_cost);
+
+            // Zerar os dados da conta
+            let mut data = cake_account.data.borrow_mut();
+            for byte in data.iter_mut() {
+                *byte = 0;
+            }
         }
         _ => return Err(ProgramError::InvalidInstructionData),
     }
-
     Ok(())
 }
