@@ -1,5 +1,5 @@
 use solana_program::{
-    account_info::{next_account_info, AccountInfo},
+    account_info::{next_account_info, AccountInfo, Account},
     entrypoint,
     entrypoint::ProgramResult,
     msg,
@@ -19,6 +19,7 @@ pub struct CakeState {
     pub stock: u64,
     pub price: u64,
     pub owner: Pubkey,
+    pub history_counter: u64, // Novo campo para contar o número de compras
 }
 
 impl Sealed for CakeState {}
@@ -30,13 +31,14 @@ impl IsInitialized for CakeState {
 }
 
 impl Pack for CakeState {
-    const LEN: usize = 48;
+    const LEN: usize = 56; // Aumentado para incluir history_counter (48 + 8 bytes)
 
     fn pack_into_slice(&self, dst: &mut [u8]) {
         let slice = dst;
         slice[..8].copy_from_slice(&self.stock.to_le_bytes());
         slice[8..16].copy_from_slice(&self.price.to_le_bytes());
         slice[16..48].copy_from_slice(self.owner.as_ref());
+        slice[48..56].copy_from_slice(&self.history_counter.to_le_bytes());
     }
 
     fn unpack_from_slice(src: &[u8]) -> Result<Self, ProgramError> {
@@ -46,7 +48,8 @@ impl Pack for CakeState {
         let stock = u64::from_le_bytes(src[..8].try_into().unwrap());
         let price = u64::from_le_bytes(src[8..16].try_into().unwrap());
         let owner = Pubkey::try_from(&src[16..48]).map_err(|_| ProgramError::InvalidAccountData)?;
-        Ok(CakeState { stock, price, owner })
+        let history_counter = u64::from_le_bytes(src[48..56].try_into().unwrap());
+        Ok(CakeState { stock, price, owner, history_counter })
     }
 }
 
@@ -123,6 +126,7 @@ pub fn process_instruction(
             cake_state.stock = 100;
             cake_state.price = 1_000_000;
             cake_state.owner = *owner.key;
+            cake_state.history_counter = 0; // Inicializa o contador
             CakeState::pack(cake_state, &mut cake_account.data.borrow_mut())?;
         }
         1 => {
@@ -207,6 +211,10 @@ pub fn process_instruction(
 
             // Atualizar o estoque
             cake_state.stock -= amount;
+
+            // Incrementar o contador de histórico
+            let history_index = cake_state.history_counter;
+            cake_state.history_counter += 1;
             CakeState::pack(cake_state, &mut cake_account.data.borrow_mut())?;
 
             // Criar uma nova conta de histórico
@@ -221,9 +229,18 @@ pub fn process_instruction(
                 program_id,
             );
 
-            // Derivar o bump para o endereço da history_account
+            // Obter o timestamp atual para usar como parte das sementes
+            let clock_info = Clock::from_account_info(clock)?;
+            let timestamp = clock_info.unix_timestamp;
+
+            // Derivar o bump para o endereço da history_account, usando o history_index
             let (expected_history_account, bump) = Pubkey::find_program_address(
-                &[b"history", buyer.key.as_ref(), &[instruction_data[9]]],
+                &[
+                    b"history",
+                    buyer.key.as_ref(),
+                    &[instruction_data[9]], // product_id
+                    &history_index.to_le_bytes(), // history_index como bytes
+                ],
                 program_id,
             );
 
@@ -240,11 +257,16 @@ pub fn process_instruction(
                     history_account.clone(),
                     system_program.clone(),
                 ],
-                &[&[b"history", buyer.key.as_ref(), &[instruction_data[9]], &[bump]]],
+                &[
+                    &[
+                        b"history",
+                        buyer.key.as_ref(),
+                        &[instruction_data[9]],
+                        &history_index.to_le_bytes(),
+                        &[bump],
+                    ],
+                ],
             )?;
-
-            let clock_info = Clock::from_account_info(clock)?;
-            let timestamp = clock_info.unix_timestamp;
 
             let product_id = instruction_data[9]; // O product_id é enviado como o próximo byte após a quantidade
 
@@ -309,33 +331,43 @@ pub fn process_instruction(
             let owner = next_account_info(account_iter)?; // 1: owner
             let system_program = next_account_info(account_iter)?; // 2: system_program
 
+            msg!("Verificando se a conta pertence ao programa...");
             if cake_account.owner != program_id {
+                msg!("Erro: Conta não pertence ao programa. Owner: {}, Program ID: {}", cake_account.owner, program_id);
                 return Err(ProgramError::IncorrectProgramId);
             }
 
+            msg!("Deserializando o estado da conta...");
             let cake_state = CakeState::unpack(&cake_account.data.borrow())?;
+            msg!("Estado deserializado: stock: {}, price: {}, owner: {}", cake_state.stock, cake_state.price, cake_state.owner);
+
+            msg!("Verificando se o owner é o proprietário correto...");
             if cake_state.owner != *owner.key {
+                msg!("Erro: Owner não corresponde. Estado owner: {}, Owner fornecido: {}", cake_state.owner, owner.key);
                 return Err(ProgramError::InvalidAccountData);
             }
 
-            // Reatribuir a conta ao SystemProgram
-            let assign_ix = system_instruction::assign(
-                cake_account.key,
-                &system_program::id(),
-            );
-            solana_program::program::invoke(
-                &assign_ix,
-                &[
-                    cake_account.clone(),
-                    system_program.clone(),
-                ],
-            )?;
+            msg!("Transferindo lamports para o owner...");
+            let lamports = cake_account.lamports();
+            msg!("Lamports na conta: {}", lamports);
+            {
+                msg!("Obtendo borrow mutável para cake_account.lamports...");
+                let mut cake_lamports = cake_account.lamports.borrow_mut();
+                msg!("Obtendo borrow mutável para owner.lamports...");
+                let mut owner_lamports = owner.lamports.borrow_mut();
+                msg!("Zerando lamports da conta e transferindo para o owner...");
+                **cake_lamports = 0;
+                **owner_lamports += lamports;
+                msg!("Transferência de lamports concluída.");
+            }
 
-            // Zerar os dados da conta
+            msg!("Obtendo borrow mutável para os dados da conta...");
             let mut data = cake_account.data.borrow_mut();
+            msg!("Zerando os dados da conta...");
             for byte in data.iter_mut() {
                 *byte = 0;
             }
+            msg!("Dados zerados. Conta fechada com sucesso.");
         }
         _ => return Err(ProgramError::InvalidInstructionData),
     }
