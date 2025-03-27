@@ -169,11 +169,11 @@ pub fn process_instruction(
         1 => {
             msg!("Instrução: add_product");
             let account_iter = &mut accounts.iter();
-            let cake_account = next_account_info(account_iter)?;
-            let product_account = next_account_info(account_iter)?;
-            let owner = next_account_info(account_iter)?;
-            let payer = next_account_info(account_iter)?;
-            let system_program = next_account_info(account_iter)?;
+            let cake_account = next_account_info(account_iter)?; // 0: cake_account
+            let product_account = next_account_info(account_iter)?; // 1: product_account
+            let owner = next_account_info(account_iter)?; // 2: owner
+            let payer = next_account_info(account_iter)?; // 3: payer
+            let system_program = next_account_info(account_iter)?; // 4: system_program
 
             if cake_account.owner != program_id {
                 return Err(ProgramError::IncorrectProgramId);
@@ -194,6 +194,7 @@ pub fn process_instruction(
                 return Err(ProgramError::InvalidAccountData);
             }
 
+            // Criar a product_account usando invoke_signed
             let rent = Rent::get()?;
             let rent_lamports = rent.minimum_balance(Product::LEN);
 
@@ -215,23 +216,36 @@ pub fn process_instruction(
                 &[&[b"product", &product_id.to_le_bytes(), &[bump]]],
             )?;
 
-            let name_bytes = &instruction_data[1..33];
-            let mut name = [0u8; 32];
-            name.copy_from_slice(name_bytes);
+            let name_str = String::from_utf8(instruction_data[1..33].to_vec())
+                .map_err(|_| ProgramError::InvalidInstructionData)?
+                .trim_end_matches('\0')
+                .to_string();
+            let description_str = String::from_utf8(instruction_data[33..161].to_vec())
+                .map_err(|_| ProgramError::InvalidInstructionData)?
+                .trim_end_matches('\0')
+                .to_string();
 
-            let description_bytes = &instruction_data[33..161];
+            // Converter name_str para [u8; 32]
+            let mut name = [0u8; 32];
+            let name_bytes = name_str.as_bytes();
+            let name_len = name_bytes.len().min(32);
+            name[..name_len].copy_from_slice(&name_bytes[..name_len]);
+
+            // Converter description_str para [u8; 128]
             let mut description = [0u8; 128];
-            description.copy_from_slice(description_bytes);
+            let description_bytes = description_str.as_bytes();
+            let description_len = description_bytes.len().min(128);
+            description[..description_len].copy_from_slice(&description_bytes[..description_len]);
 
             let price = u64::from_le_bytes(instruction_data[161..169].try_into().unwrap());
-            let initial_stock = u64::from_le_bytes(instruction_data[169..177].try_into().unwrap());
+            let stock = u64::from_le_bytes(instruction_data[169..177].try_into().unwrap());
 
             let product = Product {
                 id: product_id,
                 name,
                 description,
                 price,
-                stock: initial_stock,
+                stock,
             };
             Product::pack(product, &mut product_account.data.borrow_mut())?;
 
@@ -311,6 +325,10 @@ pub fn process_instruction(
             let history_account = next_account_info(account_iter)?; // 5: history_account
             let payer = next_account_info(account_iter)?; // 6: payer
             let clock = next_account_info(account_iter)?; // 7: clock
+            let buyer_token = next_account_info(account_iter)?; // 8: buyer_token
+            let owner_token = next_account_info(account_iter)?; // 9: owner_token
+            let token_program = next_account_info(account_iter)?; // 10: token_program
+            let usdt_mint = next_account_info(account_iter)?; // 11: usdt_mint
 
             if cake_account.owner != program_id {
                 return Err(ProgramError::IncorrectProgramId);
@@ -339,18 +357,30 @@ pub fn process_instruction(
 
             let total_price = amount * product.price;
 
-            // Transferir SOL do comprador para o owner
-            let transfer_ix = system_instruction::transfer(
+            // Validate USDT mint
+            let buyer_token_data = spl_token::state::Account::unpack(&buyer_token.data.borrow())?;
+            let owner_token_data = spl_token::state::Account::unpack(&owner_token.data.borrow())?;
+            if buyer_token_data.mint != *usdt_mint.key || owner_token_data.mint != *usdt_mint.key {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            // Transfer USDT
+            let transfer_ix = spl_token::instruction::transfer(
+                token_program.key,
+                buyer_token.key,
+                owner_token.key,
                 buyer.key,
-                owner.key,
+                &[],
                 total_price,
-            );
+            )?;
+
             solana_program::program::invoke(
                 &transfer_ix,
                 &[
+                    buyer_token.clone(),
+                    owner_token.clone(),
                     buyer.clone(),
-                    owner.clone(),
-                    system_program.clone(),
+                    token_program.clone(),
                 ],
             )?;
 
@@ -360,7 +390,7 @@ pub fn process_instruction(
             let rent = Rent::get()?;
             let rent_lamports = rent.minimum_balance(PurchaseHistory::LEN);
 
-            let history_index = cake_state.history_counter; // Usar history_counter
+            let history_index = cake_state.history_counter;
             let (expected_history_account, bump) = Pubkey::find_program_address(
                 &[
                     b"history",
@@ -390,22 +420,20 @@ pub fn process_instruction(
                     history_account.clone(),
                     system_program.clone(),
                 ],
-                &[
-                    &[
-                        b"history",
-                        buyer.key.as_ref(),
-                        &product_id.to_le_bytes(),
-                        &history_index.to_le_bytes(),
-                        &[bump],
-                    ],
-                ],
+                &[&[
+                    b"history",
+                    buyer.key.as_ref(),
+                    &product_id.to_le_bytes(),
+                    &history_index.to_le_bytes(),
+                    &[bump],
+                ]],
             )?;
 
             let clock_info = Clock::from_account_info(clock)?;
             let timestamp = clock_info.unix_timestamp;
 
             let history_entry = PurchaseHistory {
-                product_id: product_id as u8,
+                product_id: product_id as u8, // Consider changing to u64 if product IDs exceed 255
                 quantity: amount,
                 total_price,
                 buyer: *buyer.key,
@@ -413,7 +441,6 @@ pub fn process_instruction(
             };
             PurchaseHistory::pack(history_entry, &mut history_account.data.borrow_mut())?;
 
-            // Incrementar o history_counter após criar a conta de histórico
             cake_state.history_counter += 1;
             CakeState::pack(cake_state, &mut cake_account.data.borrow_mut())?;
         }
