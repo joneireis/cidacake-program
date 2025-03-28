@@ -409,6 +409,7 @@ dependencies = [
  "solana-sdk",
  "spl-token",
  "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
